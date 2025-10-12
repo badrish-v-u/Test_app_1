@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Simple audio downloader microservice for a karaoke app.
-- Creates ./all_songs if not present
-- POST /download { "url": "<youtube-url>" }  -> downloads ONLY that video's audio
-- GET  /songs -> list of available files
-- Serves static audio at /all_songs/<filename>
-- Auto-installs yt-dlp if missing
-- Auto-downloads a static FFmpeg build when not present; falls back to original audio if needed
-- Best-effort to return a single video even if the URL includes playlist/mix params
-"""
 
 import os
 import re
@@ -25,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.staticfiles import StaticFiles
@@ -34,7 +24,17 @@ APP_DIR = Path(__file__).parent.resolve()
 SONGS_DIR = APP_DIR / "all_songs"
 SONGS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ------------- utilities -------------
+API_TOKEN = os.getenv("API_TOKEN", "")  # set this in Render → Environment
+
+# ----- security dependency -----
+def require_token(request: Request):
+    if not API_TOKEN:
+        return  # token check disabled if env not set
+    tok = request.headers.get("x-api-token") or request.query_params.get("token")
+    if tok != API_TOKEN:
+        raise HTTPException(401, "Unauthorized")
+
+# ----- utils -----
 def have_cmd(name: str) -> bool:
     return shutil.which(name) is not None
 
@@ -45,18 +45,14 @@ def run(cmd):
         return e
 
 def pip_install(pkg: str):
-    run([get_python_exe(), "-m", "pip", "install", "-U", pkg])
-
-def get_python_exe() -> str:
     import sys
-    return sys.executable
+    run([sys.executable, "-m", "pip", "install", "-U", pkg])
 
 def http_get(url: str, headers: dict = None, timeout: int = 60):
     import urllib.request
     req = urllib.request.Request(url, headers=headers or {"User-Agent": "Mozilla/5.0"})
     return urllib.request.urlopen(req, timeout=timeout)
 
-# keep only single-video parameters
 _SINGLE_VIDEO_SAFE_PARAMS = {"v", "t", "time_continue"}
 
 def sanitize_to_single_video(url: str) -> str:
@@ -65,15 +61,12 @@ def sanitize_to_single_video(url: str) -> str:
         host = u.netloc.lower()
         if host not in {"www.youtube.com", "youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be"}:
             return url
-
-        # youtu.be short links -> convert to watch?v=
         if host.endswith("youtu.be"):
             video_id = u.path.strip("/").split("/")[0]
             if video_id:
                 new_q = dict(parse_qsl(u.query or ""))
                 new_q["v"] = video_id
                 return f"https://www.youtube.com/watch?{urlencode(new_q)}"
-
         q = dict(parse_qsl(u.query or ""))
         if "v" in q:
             clean_q = {k: v for k, v in q.items() if k in _SINGLE_VIDEO_SAFE_PARAMS}
@@ -125,23 +118,19 @@ def _extract_ffmpeg_from_tar_xz(tar_bytes: bytes, out_dir: Path, wanted_names):
         return extracted
 
 def ensure_ffmpeg() -> Optional[Path]:
-    # Use system ffmpeg if available
     if have_cmd("ffmpeg"):
         return Path(shutil.which("ffmpeg"))
 
-    # cached portable
     tmp_home = APP_DIR / ".portable_ffmpeg"
     tmp_home.mkdir(parents=True, exist_ok=True)
     ffmpeg_bin = tmp_home / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
     if ffmpeg_bin.exists():
         return ffmpeg_bin
 
-    # attempt to fetch a static build (best-effort)
     try:
         system = platform.system().lower()
 
         if system == "darwin":
-            # macOS static builds from evermeet.cx
             index_url = "https://evermeet.cx/ffmpeg/"
             html = http_get(index_url).read().decode("utf-8", errors="ignore")
             zips = re.findall(r'href="(ffmpeg-\d+(?:\.\d+)*\.zip)"', html)
@@ -154,7 +143,6 @@ def ensure_ffmpeg() -> Optional[Path]:
                 return extracted["ffmpeg"]
 
         elif system == "windows":
-            # Windows static builds from BtbN GitHub releases
             api = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest"
             meta = json.loads(http_get(api, headers={"User-Agent": "curl"}).read().decode("utf-8"))
             assets = meta.get("assets", [])
@@ -170,7 +158,6 @@ def ensure_ffmpeg() -> Optional[Path]:
                 return extracted["ffmpeg.exe"]
 
         else:
-            # Linux static builds from BtbN
             api = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest"
             meta = json.loads(http_get(api, headers={"User-Agent": "curl"}).read().decode("utf-8"))
             assets = meta.get("assets", [])
@@ -184,57 +171,50 @@ def ensure_ffmpeg() -> Optional[Path]:
     except Exception:
         pass
 
-    # if we got here, we failed to fetch ffmpeg; we'll proceed without it
     return None
 
 def best_format(ffmpeg_ok: bool) -> str:
-    # if we can postprocess, any bestaudio is fine (we'll convert to mp3)
-    # else try m4a first for compatibility, else bestaudio
     return "bestaudio/best" if ffmpeg_ok else "bestaudio[ext=m4a]/bestaudio/bestaudio*"
 
-# ------------- app -------------
+# ----- app -----
 app = FastAPI(title="Karaoke Audio Downloader")
 
-# Allow your GoDaddy site to call this service (adjust origins if you have a custom domain)
+# CORS: since you’ll call through proxy.php, this can remain permissive or tightened later.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # for quick start; tighten to your domain later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Serve audio files statically at /all_songs
 app.mount("/all_songs", StaticFiles(directory=str(SONGS_DIR), html=False), name="all_songs")
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.get("/songs")
+@app.get("/songs", dependencies=[Depends(require_token)])
 def list_songs(request: Request):
-    """Return a list of audio files in all_songs with absolute URLs."""
+    base = str(request.base_url).rstrip("/")
     files = []
     for p in sorted(SONGS_DIR.iterdir()):
         if p.is_file() and p.suffix.lower() in {".mp3", ".m4a", ".opus", ".webm"}:
+            rel = f"/all_songs/{p.name}"
             files.append({
                 "name": p.name,
                 "size_bytes": p.stat().st_size,
-                "url": str(request.base_url)[:-1] + f"/all_songs/{p.name}"
+                "url": rel,
+                "url_absolute": base + rel,
             })
     return {"count": len(files), "items": files}
 
-@app.post("/download")
+@app.post("/download", dependencies=[Depends(require_token)])
 async def download_song(payload: dict):
-    """
-    JSON body: { "url": "https://www.youtube.com/watch?v=..." }
-    Downloads ONLY that video's audio into ./all_songs/
-    """
     raw_url = (payload or {}).get("url", "").strip()
     if not raw_url:
         raise HTTPException(400, "Missing 'url'")
 
-    # ensure dependencies
     try:
         ensure_yt_dlp()
     except Exception as e:
@@ -246,7 +226,6 @@ async def download_song(payload: dict):
     ffmpeg_path = ensure_ffmpeg()
     ffmpeg_ok = ffmpeg_path is not None
 
-    postprocessors = []
     ydl_opts = {
         "noplaylist": True,
         "restrictfilenames": False,
@@ -256,26 +235,22 @@ async def download_song(payload: dict):
         "outtmpl": str(SONGS_DIR / "%(title)s.%(ext)s"),
         "format": best_format(ffmpeg_ok),
         "ignoreerrors": False,
-        "merge_output_format": None,
     }
 
     if ffmpeg_ok:
         ydl_opts["ffmpeg_location"] = str(ffmpeg_path.parent)
-        postprocessors = [{
+        ydl_opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
-            "preferredquality": "0",  # best VBR
+            "preferredquality": "0",
         }]
-        ydl_opts["postprocessors"] = postprocessors
 
-    # run download
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            res = ydl.download([target_url])
+            ydl.download([target_url])
     except Exception as e:
         raise HTTPException(500, f"Download failed: {e}")
 
-    # find the newest file as the likely output
     newest = None
     newest_mtime = -1
     for p in SONGS_DIR.iterdir():
@@ -284,21 +259,18 @@ async def download_song(payload: dict):
             if m > newest_mtime:
                 newest_mtime = m
                 newest = p
-
     if not newest:
         raise HTTPException(500, "No output file created")
 
+    rel = f"/all_songs/{newest.name}"
     return {
         "status": "ok",
         "filename": newest.name,
         "size_bytes": newest.stat().st_size,
-        "url": f"/all_songs/{newest.name}"
+        "url": rel,
+        "url_absolute": str(request.base_url).rstrip("/") + rel,
     }
 
-# helpful root
 @app.get("/")
 def root():
-    return {
-        "service": "Karaoke Audio Downloader",
-        "routes": ["/download (POST)", "/songs (GET)", "/all_songs/* (static)", "/health (GET)"]
-    }
+    return {"service": "Karaoke Audio Downloader", "routes": ["/download (POST)", "/songs (GET)", "/all_songs/* (static)", "/health (GET)"]}
