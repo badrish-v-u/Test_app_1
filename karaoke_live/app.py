@@ -24,7 +24,7 @@ APP_DIR = Path(__file__).parent.resolve()
 SONGS_DIR = APP_DIR / "all_songs"
 SONGS_DIR.mkdir(parents=True, exist_ok=True)
 
-API_TOKEN = os.getenv("API_TOKEN", "")  # set this in Render → Environment
+API_TOKEN = os.getenv("API_TOKEN", "8d8318e97ecc2a5465bdde27a967e25a8ec0af0fd3e3a3c7f6a805a2cad88331")  # set this in Render → Environment
 
 # ----- security dependency -----
 def require_token(request: Request):
